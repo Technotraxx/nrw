@@ -1,41 +1,27 @@
-"""Very thin wrapper around Anthropic Claude (or OpenAI GPT‑4o).
-
-Keeps LLM logic in one place so you can swap providers easily.
-"""
+"""Wrapper um Anthropic Claude 3 – erzeugt Kurz­beschreibungen."""
 from __future__ import annotations
-
-from typing import Any, Iterable
-
-from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT  # type: ignore
-
+from typing import Any
+from anthropic import Anthropic
 from .config import Config
 
 cfg = Config()
 _client = Anthropic(api_key=cfg.anthropic_api_key) if cfg.anthropic_api_key else None
 
-PROMPT_TEMPLATE = (
-    """{human}\n"""
-    "Du erhältst strukturierte Daten zu einer nordrhein‑westfälischen Kommune als JSON. "
-    "Erstelle daraus eine prägnante, sachliche Zusammenfassung (max 80 Wörter) auf Deutsch.\n"
-    "{data}\n"
-    "{assistant}"""
+PROMPT = (
+    "Du erhältst JSON-Daten zu einer nordrhein-westfälischen Kommune. "
+    "Schreibe eine prägnante, seriöse Zusammenfassung (max 80 Wörter) auf Deutsch. "
+    "Nutze Einwohner, Fläche und eventuelle Besonderheiten.\n\n"
+    "Daten:\n{data}\n\nZusammenfassung:"
 )
 
-
-def generate_summary(gemeinde_dict: dict[str, Any]) -> str | None:
-    """Return LLM‑generated summary text (or None if key missing)."""
-    if not _client:
-        return None  # Key not configured; caller decides fallback
-
-    prompt = PROMPT_TEMPLATE.format(
-        human=HUMAN_PROMPT,
-        data=str(gemeinde_dict),
-        assistant=AI_PROMPT,
-    )
-    resp = _client.completions.create(
-        model="claude-3-opus-20240229",
-        max_tokens_to_sample=200,
+def generate_summary(data: dict[str, Any]) -> str | None:
+    if _client is None:
+        return None
+    msg = _client.messages.create(
+        model=cfg.anthropic_model,
+        max_tokens=cfg.anthropic_max_tokens,
         temperature=0.3,
-        prompt=prompt,
+        system="NRW Gemeinden Extractor MVP",
+        content=PROMPT.format(data=data),
     )
-    return resp.completion.strip()
+    return msg.content[0].text.strip() if msg.content else None
