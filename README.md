@@ -19,3 +19,22 @@ cp .env.example .env  # then fill in API keys
 
 # 3. Run Streamlit app
 streamlit run app.py
+
+```
+### Directory Layout
+.
+├── app.py            # Streamlit UI
+├── requirements.txt  # Python deps
+├── .env.example      # env‑var template
+└── src/              # Python package
+    ├── __init__.py
+    ├── config.py     # Config dataclass
+    ├── extract.py    # Wikipedia extraction
+    ├── llm.py        # LLM calls
+    ├── export.py     # CSV + Airtable
+    └── run_pipeline.py  # CLI wrapper
+
+
+### License
+
+Content harvested from Wikipedia is licensed CC‑BY‑SA 4.0; please attribute accordingly.
