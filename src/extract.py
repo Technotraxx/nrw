@@ -1,10 +1,14 @@
-"""Download & parse Wikipedia pages for NRW municipalities – volle Feldabdeckung."""
+"""NRW-Gemeinden – Scraper, Infobox-Parser & Volltext."""
+
 from __future__ import annotations
-import re, time, requests
+import re, time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
-from typing import Optional, Any, List, Tuple
+from typing import Any, List, Optional, Tuple
+from urllib.parse import quote
+
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
 from rich.progress import track
 from .config import Config
@@ -13,116 +17,124 @@ cfg = Config()
 _session = requests.Session()
 _session.headers.update({"User-Agent": cfg.user_agent})
 
-# ------------------------------------------------------------------ #
-# Datenmodell
-# ------------------------------------------------------------------ #
+# -------------------- Datenmodell --------------------
 @dataclass
 class Gemeinde:
-    name: str
-    url: str
-    # Infobox-Felder
-    einwohner: Optional[str] = None
-    flaeche_km2: Optional[str] = None
-    hoehe_m: Optional[str] = None
+    name: str; url: str
+    einwohner: Optional[int] = None; einwohner_datum: Optional[str] = None
+    flaeche_km2: Optional[float] = None; hoehe_m: Optional[int] = None
     gemeindeschluessel: Optional[str] = None
-    landkreis: Optional[str] = None
-    regierungsbezirk: Optional[str] = None
+    landkreis: Optional[str] = None; regierungsbezirk: Optional[str] = None
     bundesland: Optional[str] = None
-    postleitzahl: Optional[str] = None
-    vorwahl: Optional[str] = None
+    postleitzahl: Optional[str] = None; vorwahl: Optional[str] = None
     kfz_kennzeichen: Optional[str] = None
-    koordinaten: Optional[str] = None
-    website: Optional[str] = None
-    buergermeister: Optional[str] = None
-    # LLM
+    koordinaten: Optional[str] = None; koordinaten_url: Optional[str] = None
+    website: Optional[str] = None; buergermeister: Optional[str] = None
+    full_text: Optional[str] = None
     beschreibung_llm: Optional[str] = None
+    def to_dict(self) -> dict[str, Any]: return asdict(self)
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-# ------------------------------------------------------------------ #
-# Scraper-Hilfen
-# ------------------------------------------------------------------ #
+# -------------------- Helper --------------------
 def _get(url: str) -> str:
-    """HTTP-GET mit 3-fach Retry + Backoff."""
-    for attempt in range(3):
+    for att in range(3):
         r = _session.get(url, timeout=30)
-        if r.status_code == 200:
-            return r.text
-        time.sleep(2 * (attempt + 1))
+        if r.ok: return r.text
+        time.sleep(2 * (att + 1))
     r.raise_for_status()
 
-def _clean(text: str) -> str:
-    return re.sub(r"\\[.*?\\]", "", text).strip()
+def _lower_keys(df) -> dict[str, str]:
+    out = {}
+    for _, row in df.iterrows():
+        if len(row) >= 2:
+            k = str(row.iloc[0]).strip().lower().rstrip(":")
+            v = str(row.iloc[1]).strip()
+            out[k] = v
+    return out
 
-LABEL_MAP = {
-    "Einwohner": "einwohner",
-    "Fläche": "flaeche_km2",
-    "Höhe": "hoehe_m",
-    "Gemeindeschlüssel": "gemeindeschluessel",
-    "Landkreis": "landkreis",
-    "Regierungsbezirk": "regierungsbezirk",
-    "Bundesland": "bundesland",
-    "Postleitzahl": "postleitzahl",
-    "Vorwahl": "vorwahl",
-    "Kfz": "kfz_kennzeichen",
-    "KFZ": "kfz_kennzeichen",
-    "Kfz-Kennzeichen": "kfz_kennzeichen",
-    "Koordinaten": "koordinaten",
-    "Website": "website",
-    "Bürgermeister": "buergermeister",
-}
+def _first(d, keys: list[str]) -> Optional[str]:
+    for k in keys:
+        if k in d: return d[k]
+    return None
 
-WIKI_LIST_URL = (
-    "https://de.wikipedia.org/wiki/"
-    "Liste_der_St%C3%A4dte_und_Gemeinden_in_Nordrhein-Westfalen"
-)
+# -------------------- Parsing --------------------
+def parse_page(name: str, url: str, char_limit: int) -> dict[str, Any]:
+    info: dict[str, Any] = {}
 
-# ------------------------------------------------------------------ #
-# Hauptfunktionen
-# ------------------------------------------------------------------ #
-def get_gemeinden_list() -> List[Tuple[str, str]]:
-    html = _get(WIKI_LIST_URL)
+    # -- Pandas-Infobox -----------------
+    try:
+        df = pd.read_html(url)[0]
+        ib = _lower_keys(df)
+    except Exception:
+        ib = {}
+
+    # Einwohner + Datum
+    if (t := _first(ib, ["einwohner", "bevölkerung"])):
+        if (m := re.search(r"([\d\.]+)", t)): info["einwohner"] = int(m[1].replace(".", ""))
+        if (d := re.search(r"\(([^)]*)\)", t)): info["einwohner_datum"] = d[1]
+
+    # Fläche / Höhe
+    if (t := ib.get("fläche")) and (m := re.search(r"([\d,\.]+)", t)):
+        info["flaeche_km2"] = float(m[1].replace(",", "."))
+    if (t := ib.get("höhe")) and (m := re.search(r"(\d+)", t)):
+        info["hoehe_m"] = int(m[1])
+
+    # Direktfelder
+    for key, attr in {
+        "gemeindeschlüssel": "gemeindeschluessel",
+        "landkreis": "landkreis",
+        "regierungsbezirk": "regierungsbezirk",
+        "bundesland": "bundesland",
+        "postleitzahl": "postleitzahl",
+        "vorwahl": "vorwahl",
+        "kfz-kennzeichen": "kfz_kennzeichen",
+    }.items():
+        if key in ib: info[attr] = ib[key]
+
+    # Website, Bürgermeister
+    if (w := _first(ib, ["website", "homepage"])): info["website"] = w if w.startswith("http") else "https://" + w
+    if (bm := _first(ib, ["bürgermeister", "oberbürgermeister"])): info["buergermeister"] = re.sub(r"\([^)]*\)", "", bm).strip()
+
+    # -- BeautifulSoup für Koordinaten & Volltext ----
+    html = _get(url)
     soup = BeautifulSoup(html, "html.parser")
-    links = soup.select("table.wikitable tbody tr td:first-child a")
+
+    # Koordinaten & GeoHack-Link
+    geo = soup.select_one("table.infobox span.geo")
+    if geo:
+        info["koordinaten"] = geo.text.strip()
+        if geo.parent.name == "a": info["koordinaten_url"] = geo.parent["href"]
+    # Fallback: erster externer geohack-Link
+    if not info.get("koordinaten_url"):
+        a = soup.find("a", href=re.compile("geohack"))
+        if a: info["koordinaten_url"] = a["href"]
+
+    # Volltext (ohne Infobox/Navbox)
+    content = soup.find("div", class_="mw-parser-output")
+    if content:
+        for tag in content.find_all(["table", "div"], class_=re.compile("(infobox|navbox)")):
+            tag.decompose()
+        text = content.get_text(" ", strip=True)
+        info["full_text"] = text[:char_limit]
+
+    return info
+
+# -------------------- Pipeline --------------------
+LIST_URL = "https://de.wikipedia.org/wiki/Liste_der_Gemeinden_in_Nordrhein-Westfalen"
+def get_gemeinden_list() -> List[Tuple[str, str]]:
+    soup = BeautifulSoup(_get(LIST_URL), "html.parser")
     return [
-        (
-            a.get("title") or a["href"].split("/wiki/")[1].replace("_", " "),
-            f"https://de.wikipedia.org{a['href']}",
-        )
-        for a in links
+        (a.get("title") or a["href"].split("/wiki/")[1].replace("_", " "),
+         f"https://de.wikipedia.org{a['href']}")
+        for a in soup.select("table.wikitable tbody tr td:first-child a")
         if a["href"].startswith("/wiki/")
     ]
 
-def parse_infobox(html: str) -> dict[str, str | None]:
-    soup = BeautifulSoup(html, "html.parser")
-    box = soup.find(class_=re.compile("infobox"))
-    data = {v: None for v in LABEL_MAP.values()}
-    if not box:
-        return data
-    for row in box.select("tr"):
-        h, v = row.find("th"), row.find("td")
-        if not h or not v:
-            continue
-        header = _clean(h.get_text(" ", strip=True))
-        value  = _clean(v.get_text(" ", strip=True))
-        for label, attr in LABEL_MAP.items():
-            if re.search(fr"^{label}", header, re.I):
-                data[attr] = value
-                break
-    return data
+def fetch_one(job: Tuple[str, str, int]) -> Gemeinde:
+    name, url, cl = job
+    return Gemeinde(name=name, url=url, **parse_page(name, url, cl))
 
-def fetch_one(item: Tuple[str, str]) -> Gemeinde:
-    name, url = item
-    info = parse_infobox(_get(url))
-    return Gemeinde(name=name, url=url, **info)
-
-def run_extraction(limit: Optional[int] = None) -> list[Gemeinde]:
-    items = get_gemeinden_list()
-    if limit:
-        items = items[:limit]
-    results: list[Gemeinde] = []
+def run_extraction(limit: Optional[int], char_limit: int) -> List[Gemeinde]:
+    items = get_gemeinden_list()[:limit] if limit else get_gemeinden_list()
+    jobs = [(n, u, char_limit) for n, u in items]
     with ThreadPoolExecutor(max_workers=cfg.max_workers) as pool:
-        for g in track(pool.map(fetch_one, items), total=len(items), description="Scraping"):
-            results.append(g)
-    return results
+        return list(track(pool.map(fetch_one, jobs), total=len(jobs), description="Scraping"))
